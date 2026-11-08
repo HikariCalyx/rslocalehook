@@ -186,6 +186,16 @@ fn run(args: RunArgs) -> Result<()> {
         std::process::exit(code as i32);
     }
 
+    // Injection is same-bitness only. If the target is the opposite bitness to
+    // this launcher, hand the whole job to the matching-bitness sibling launcher
+    // deployed next to us (which injects the correct hook DLL).
+    if let Some(target_is_64) = pe_is_64bit(&program) {
+        if target_is_64 != rslocalehook_common::BUILD_IS_64BIT {
+            let code = delegate_to_sibling(&args, &program, target_is_64)?;
+            std::process::exit(code);
+        }
+    }
+
     let dll = hook_dll_path()?;
 
     let command_line = match args.args.as_deref() {
@@ -218,16 +228,18 @@ fn effective_no_hook(args: &RunArgs) -> Vec<String> {
     patterns
 }
 
-/// Rebuilds the launcher's argument string for an elevated relaunch. The
-/// resolved absolute program path is used, and `--elevate` is intentionally
-/// omitted so the elevated instance runs the target directly without looping.
-fn build_relaunch_params(args: &RunArgs, program: &std::path::Path) -> String {
-    let mut parts = vec!["run".to_string(), quote(&program.to_string_lossy())];
+/// Reconstructs the launcher's `run` argument vector (for re-invoking this or a
+/// sibling launcher). The resolved absolute program path is used, and
+/// `--elevate` is intentionally omitted so re-invocation never loops. The
+/// built-in anti-cheat defaults are not re-emitted; the new instance re-derives
+/// them itself from `--hook-anticheat` and the user's own `--no-hook` values.
+fn relaunch_arg_vec(args: &RunArgs, program: &std::path::Path) -> Vec<String> {
+    let mut parts = vec!["run".to_string(), program.to_string_lossy().into_owned()];
     parts.push("--nls".into());
     parts.push(args.nls.clone());
     if let Some(timezone) = &args.timezone {
         parts.push("--timezone".into());
-        parts.push(quote(timezone));
+        parts.push(timezone.clone());
     }
     if let Some(codepage) = args.codepage {
         parts.push("--codepage".into());
@@ -239,20 +251,28 @@ fn build_relaunch_params(args: &RunArgs, program: &std::path::Path) -> String {
     if args.hooklcid {
         parts.push("--hooklcid".into());
     }
-    // Only the user's own patterns and the opt-out flag are re-emitted; the
-    // elevated instance re-derives the built-in defaults itself.
     for pattern in &args.no_hook {
         parts.push("--no-hook".into());
-        parts.push(quote(pattern));
+        parts.push(pattern.clone());
     }
     if args.hook_anticheat {
         parts.push("--hook-anticheat".into());
     }
     if let Some(extra) = &args.args {
         parts.push("--args".into());
-        parts.push(quote(extra));
+        parts.push(extra.clone());
     }
-    parts.join(" ")
+    parts
+}
+
+/// Joins [`relaunch_arg_vec`] into a single, quoted command-line string for
+/// `ShellExecuteExW` (which takes the parameters as one string).
+fn build_relaunch_params(args: &RunArgs, program: &std::path::Path) -> String {
+    relaunch_arg_vec(args, program)
+        .iter()
+        .map(|part| quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Wraps a value in double quotes if it contains characters that the command
@@ -305,18 +325,86 @@ fn bias_minutes(name: &str) -> Result<i32> {
     Ok(minutes as i32)
 }
 
-/// Locates the hook DLL next to the launcher executable.
+/// File name of the hook DLL that matches this launcher's bitness.
+#[cfg(target_pointer_width = "64")]
+const HOOK_DLL: &str = "rslocalehook_hook.dll";
+#[cfg(target_pointer_width = "32")]
+const HOOK_DLL: &str = "rslocalehook_hook32.dll";
+
+/// File name of the opposite-bitness launcher used to handle mismatched targets.
+#[cfg(target_pointer_width = "64")]
+const SIBLING_LAUNCHER: &str = "rslocalehook32.exe";
+#[cfg(target_pointer_width = "32")]
+const SIBLING_LAUNCHER: &str = "rslocalehook.exe";
+
+/// Locates the hook DLL (matching this launcher's bitness) next to the executable.
 fn hook_dll_path() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("locating launcher executable")?;
-    let dir = exe
-        .parent()
-        .context("launcher executable has no parent directory")?;
-    let dll = dir.join("rslocalehook_hook.dll");
+    let dir = launcher_dir()?;
+    let dll = dir.join(HOOK_DLL);
     if !dll.exists() {
-        bail!(
-            "hook DLL not found next to the launcher: {}",
-            dll.display()
-        );
+        bail!("hook DLL not found next to the launcher: {}", dll.display());
     }
     Ok(dll)
+}
+
+/// Directory that contains this launcher executable.
+fn launcher_dir() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("locating launcher executable")?;
+    exe.parent()
+        .map(std::path::Path::to_path_buf)
+        .context("launcher executable has no parent directory")
+}
+
+/// Reads a PE file's machine field to decide its bitness. Returns `Some(true)`
+/// for 64-bit (AMD64/ARM64), `Some(false)` for 32-bit (I386), and `None` when
+/// the file is not a recognizable PE (e.g. a .NET "AnyCPU" image is reported by
+/// its machine field and treated accordingly).
+fn pe_is_64bit(path: &std::path::Path) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
+    const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+    const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut dos = [0u8; 0x40];
+    file.read_exact(&mut dos).ok()?;
+    if &dos[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?) as u64;
+    file.seek(SeekFrom::Start(e_lfanew)).ok()?;
+    let mut head = [0u8; 6]; // "PE\0\0" + machine (u16)
+    file.read_exact(&mut head).ok()?;
+    if &head[0..4] != b"PE\0\0" {
+        return None;
+    }
+    let machine = u16::from_le_bytes([head[4], head[5]]);
+    match machine {
+        IMAGE_FILE_MACHINE_I386 => Some(false),
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 => Some(true),
+        _ => None,
+    }
+}
+
+/// Hands the launch over to the opposite-bitness sibling launcher and returns
+/// its exit code.
+fn delegate_to_sibling(
+    args: &RunArgs,
+    program: &std::path::Path,
+    target_is_64: bool,
+) -> Result<i32> {
+    let sibling = launcher_dir()?.join(SIBLING_LAUNCHER);
+    if !sibling.exists() {
+        bail!(
+            "target is {}-bit but the matching launcher was not found: {}",
+            if target_is_64 { "64" } else { "32" },
+            sibling.display()
+        );
+    }
+    let status = std::process::Command::new(&sibling)
+        .args(relaunch_arg_vec(args, program))
+        .status()
+        .with_context(|| format!("running sibling launcher {}", sibling.display()))?;
+    Ok(status.code().unwrap_or(1))
 }

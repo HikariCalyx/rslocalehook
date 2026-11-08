@@ -10,7 +10,7 @@ license = "LGPL-3.0-only"
 [workspace.dependencies]
 rslocalehook-common = { path = "crates/common" }
 windows-sys = "0.61.2"
-retour = "0.3.1"
+retour = "=0.4.0-alpha.4"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 

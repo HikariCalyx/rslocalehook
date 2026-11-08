@@ -22,8 +22,8 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, CreateRemoteThread, GetCurrentProcess, GetExitCodeProcess, GetExitCodeThread,
-    OpenProcessToken, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED, INFINITE,
-    LPTHREAD_START_ROUTINE, PROCESS_INFORMATION, STARTUPINFOW,
+    IsWow64Process2, OpenProcessToken, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
+    INFINITE, LPTHREAD_START_ROUTINE, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
@@ -214,6 +214,28 @@ pub fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// `true` when this crate was built as a 64-bit binary.
+pub const BUILD_IS_64BIT: bool = cfg!(target_pointer_width = "64");
+
+const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
+
+/// Returns whether `process` is a 32-bit (WOW64) process. Uses
+/// `IsWow64Process2`, which reports the process machine as `I386` for a 32-bit
+/// process and `UNKNOWN` (0) for one running natively.
+///
+/// # Safety
+/// `process` must be a valid handle with query access.
+pub unsafe fn process_is_32bit(process: *mut c_void) -> bool {
+    unsafe {
+        let mut process_machine: u16 = 0;
+        let mut native_machine: u16 = 0;
+        if IsWow64Process2(process, &mut process_machine, &mut native_machine) == 0 {
+            return false;
+        }
+        process_machine == IMAGE_FILE_MACHINE_I386
+    }
+}
+
 /// Injects `dll_path` into an already-created process by allocating the path in
 /// the remote address space and running `LoadLibraryW` on a remote thread.
 ///
@@ -222,6 +244,12 @@ pub fn to_wide(value: &str) -> Vec<u16> {
 /// write memory, and create a thread.
 pub unsafe fn inject(process: *mut c_void, dll_path: &str) -> Result<()> {
     unsafe {
+        // A DLL can only be loaded into a process of the same bitness. Refuse a
+        // mismatch up front rather than spawning a doomed remote thread.
+        if process_is_32bit(process) == BUILD_IS_64BIT {
+            bail!("target process bitness does not match the hook DLL");
+        }
+
         let wide = to_wide(dll_path);
         let bytes = wide.len() * std::mem::size_of::<u16>();
 

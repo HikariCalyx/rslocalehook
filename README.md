@@ -26,11 +26,35 @@ kept. The original project is licensed under LGPL-3.0, and so is this one.
 ## Build
 
 ```powershell
+# 64-bit
 cargo build --release
+
+# 32-bit (once: rustup target add i686-pc-windows-msvc)
+cargo build --release --target i686-pc-windows-msvc
 ```
 
-Both artifacts land in `target\release\`. Build for the architecture that
-matches your targets (a 64-bit build injects into 64-bit processes).
+For full 32-bit **and** 64-bit target support, deploy all four files in one
+folder, with the 32-bit pair suffixed `32`:
+
+```
+rslocalehook.exe           (64-bit launcher, from target\release\)
+rslocalehook_hook.dll      (64-bit hook DLL,  from target\release\)
+rslocalehook32.exe         (32-bit launcher,  from target\i686-pc-windows-msvc\release\rslocalehook.exe)
+rslocalehook_hook32.dll    (32-bit hook DLL,  from target\i686-pc-windows-msvc\release\rslocalehook_hook.dll)
+```
+
+You can run either launcher; it handles both target bitnesses (see below). If
+you only ever target one bitness, that single launcher + DLL pair is enough.
+
+### 32-bit and 64-bit targets
+
+A DLL can only be injected into a process of its own bitness. The launcher reads
+the target executable's PE header and, if the target is the opposite bitness,
+transparently hands the job to the sibling launcher (`rslocalehook32.exe` or
+`rslocalehook.exe`) deployed next to it, which injects the correct hook DLL. So
+`rslocalehook run <program>` works regardless of the program's bitness, as long
+as both pairs are present. If the matching sibling is missing, the launcher
+reports which one it needs.
 
 ## Usage
 
@@ -143,7 +167,10 @@ process inherits.
 
 ## Limitations
 
-- Injection is same-architecture only (build an x64 launcher/DLL for x64 targets).
+- A single launcher handles both target bitnesses by delegating to its sibling
+  (see above), but **child-process propagation is same-bitness only**: if a
+  hooked process spawns a child of the opposite bitness, the injection into that
+  child is refused (cleanly, without crashing it) and the child runs un-hooked.
 - The `SendMessageA` text handling covers the common window-text and
   list/combo-box string messages; some rarer messages fall through unchanged.
 - `CreateFontIndirectExA` and `ImmGetCandidateListA` from the original are not
