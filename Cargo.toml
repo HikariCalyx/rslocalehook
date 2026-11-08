@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/common", "crates/hook", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-only"
+
+[workspace.dependencies]
+rslocalehook-common = { path = "crates/common" }
+windows-sys = "0.61.2"
+retour = "0.3.1"
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to allow more optimizations
+panic = 'abort'     # Remove stack unwinding logic
+strip = true        # Automatically strip symbols from the binary
